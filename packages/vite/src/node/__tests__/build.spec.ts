@@ -569,6 +569,65 @@ describe('build', () => {
     }
   })
 
+  for (const { cssMinify, bCss, message } of [
+    {
+      cssMinify: 'esbuild',
+      bCss: 'b { color: blue; }\n}',
+      message: 'Unexpected "}"',
+    },
+    {
+      cssMinify: 'lightningcss',
+      bCss: 'b { color: blue; }\n@unknown x;',
+      message: 'Unknown at rule',
+    },
+  ] as const) {
+    for (const cssCodeSplit of [true, false]) {
+      test(`includes the source file in ${cssMinify} css minify warnings (cssCodeSplit: ${cssCodeSplit})`, async () => {
+        const warnings: string[] = []
+        const logger = createLogger()
+        logger.warn = (msg) => warnings.push(msg)
+
+        await build({
+          root: resolve(dirname, 'packages/build-project'),
+          configFile: false,
+          input: 'entry.js',
+          logLevel: 'silent',
+          customLogger: logger,
+          build: {
+            write: false,
+            cssMinify,
+            cssCodeSplit,
+          },
+          plugins: [
+            {
+              name: 'test-css-minify-warning',
+              resolveId(id) {
+                if (id === 'entry.js' || id === 'a.css' || id === 'b.css') {
+                  return '\0' + id
+                }
+              },
+              load(id) {
+                if (id === '\0entry.js') {
+                  return `import 'a.css'; import 'b.css'`
+                }
+                if (id === '\0a.css') {
+                  return 'a { color: red; }'
+                }
+                if (id === '\0b.css') {
+                  return bCss
+                }
+              },
+            },
+          ],
+        })
+
+        const output = warnings.join('\n')
+        expect(output).toMatch(/\bb\.css\b/)
+        expect(output).toContain(message)
+      })
+    }
+  }
+
   test('file hash should change when pure css chunk changes', async () => {
     const buildProject = async (cssColor: string) => {
       return (await build({

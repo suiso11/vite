@@ -257,6 +257,19 @@ const nonEscapedDoubleQuoteRe = /(?<!\\)"/g
 
 const defaultCssBundleName = 'style.css'
 
+type CssSegment = {
+  id: string
+  startLine: number
+}
+
+const countNewlines = (css: string): number => {
+  let count = 0
+  for (let i = 0; i < css.length; i++) {
+    if (css.charCodeAt(i) === 10) count++
+  }
+  return count
+}
+
 const enum PreprocessLang {
   less = 'less',
   sass = 'sass',
@@ -536,7 +549,7 @@ export function cssPostPlugin(config: ResolvedConfig): Plugin {
   // when there are multiple rollup outputs and extracting CSS, only emit once,
   // since output formats have no effect on the generated CSS.
   let hasEmitted = false
-  let chunkCSSMap: Map<string, string>
+  let chunkCSSMap: Map<string, { css: string; segments: CssSegment[] }>
 
   const rolldownOptionsOutput = config.build.rolldownOptions.output
   const assetFileNames = (
@@ -720,6 +733,8 @@ export function cssPostPlugin(config: ResolvedConfig): Plugin {
       ? {
           async renderChunk(code, chunk, opts, meta) {
             let chunkCSS: string | undefined
+            const cssSegments: CssSegment[] = []
+            let cssLine = 1
             // the chunk is empty if it's a dynamic entry chunk that only contains a CSS import
             const isJsChunkEmpty = code === '' && !chunk.isEntry
             let isPureCssChunk = chunk.exports.length === 0
@@ -747,7 +762,20 @@ export function cssPostPlugin(config: ResolvedConfig): Plugin {
                   isPureCssChunk = false
                 }
 
-                chunkCSS = (chunkCSS || '') + styles.get(id)
+                // Keep modules on separate lines so each warning line maps to one module.
+                // Only needed when minifying: otherwise it changes the emitted CSS.
+                if (
+                  config.build.cssMinify &&
+                  chunkCSS !== undefined &&
+                  !chunkCSS.endsWith('\n')
+                ) {
+                  chunkCSS += '\n'
+                  cssLine++
+                }
+                cssSegments.push({ id, startLine: cssLine })
+                const css = styles.get(id)!
+                chunkCSS = (chunkCSS ?? '') + css
+                cssLine += countNewlines(css)
               } else if (!isJsChunkEmpty) {
                 // if the module does not have a style, then it's not a pure css chunk.
                 // this is true because in the `transform` hook above, only modules
@@ -963,7 +991,7 @@ export function cssPostPlugin(config: ResolvedConfig): Plugin {
 
                   // wait for previous tasks as well
                   chunkCSS = await codeSplitEmitQueue.run(async () => {
-                    return finalizeCss(chunkCSS!, config)
+                    return finalizeCss(chunkCSS!, config, cssSegments)
                   })
 
                   if (chunkCSS || isEntry) {
@@ -993,7 +1021,7 @@ export function cssPostPlugin(config: ResolvedConfig): Plugin {
                   // But because entry chunk can be imported by dynamic import,
                   // we shouldn't remove the inlined CSS. (#10285)
 
-                  chunkCSS = await finalizeCss(chunkCSS, config)
+                  chunkCSS = await finalizeCss(chunkCSS, config, cssSegments)
                   let cssString = JSON.stringify(chunkCSS)
                   cssString =
                     renderAssetUrlInJS(
@@ -1020,7 +1048,10 @@ export function cssPostPlugin(config: ResolvedConfig): Plugin {
                 )
                 // finalizeCss is called for the aggregated chunk in generateBundle
 
-                chunkCSSMap.set(chunk.fileName, chunkCSS)
+                chunkCSSMap.set(chunk.fileName, {
+                  css: chunkCSS,
+                  segments: cssSegments,
+                })
               }
             }
 
@@ -1068,6 +1099,8 @@ export function cssPostPlugin(config: ResolvedConfig): Plugin {
         !hasEmitted
       ) {
         let extractedCss = ''
+        let extractedLine = 1
+        const extractedSegments: CssSegment[] = []
         const collected = new Set<OutputChunk>()
         // will be populated in order they are used by entry points
         const dynamicImports = new Set<string>()
@@ -1083,7 +1116,25 @@ export function cssPostPlugin(config: ResolvedConfig): Plugin {
             dynamicImports.add(importName),
           )
           // Then collect the styles of the current chunk (might overwrite some styles from previous imports)
-          extractedCss += chunkCSSMap.get(chunk.preliminaryFileName) ?? ''
+          const chunkCSS = chunkCSSMap.get(chunk.preliminaryFileName)
+          if (chunkCSS) {
+            if (
+              config.build.cssMinify &&
+              extractedCss &&
+              !extractedCss.endsWith('\n')
+            ) {
+              extractedCss += '\n'
+              extractedLine++
+            }
+            for (const segment of chunkCSS.segments) {
+              extractedSegments.push({
+                id: segment.id,
+                startLine: extractedLine + segment.startLine - 1,
+              })
+            }
+            extractedCss += chunkCSS.css
+            extractedLine += countNewlines(chunkCSS.css)
+          }
         }
 
         // The bundle is guaranteed to be deterministic, if not then we have a bug in rollup.
@@ -1099,7 +1150,11 @@ export function cssPostPlugin(config: ResolvedConfig): Plugin {
         }
 
         if (extractedCss) {
-          extractedCss = await finalizeCss(extractedCss, config)
+          extractedCss = await finalizeCss(
+            extractedCss,
+            config,
+            extractedSegments,
+          )
         }
 
         // Emit the asset if CSS remains after finalization.
@@ -2046,13 +2101,25 @@ function combineSourcemapsIfExists(
 const viteHashUpdateMarker = '/*$vite$:1*/'
 const viteHashUpdateMarkerRE = /\/\*\$vite\$:\d+\*\//
 
-async function finalizeCss(css: string, config: ResolvedConfig) {
+async function finalizeCss(
+  css: string,
+  config: ResolvedConfig,
+  segments?: CssSegment[],
+) {
   // hoist external @imports and @charset to the top of the CSS chunk per spec (#1845 and #6333)
-  if (css.includes('@import') || css.includes('@charset')) {
+  const hoisted = css.includes('@import') || css.includes('@charset')
+  if (hoisted) {
     css = hoistAtRules(css)
   }
   if (config.build.cssMinify) {
-    css = await minifyCSS(css, config, false)
+    // hoisting reorders lines, so the recorded segment offsets no longer apply
+    css = await minifyCSS(
+      css,
+      config,
+      false,
+      undefined,
+      hoisted ? undefined : segments,
+    )
   }
   if (!css.trim()) return ''
   // inject an additional string to generate a different hash for https://github.com/vitejs/vite/issues/18038
@@ -2366,11 +2433,37 @@ async function doImportCSSReplace(
   return `@import ${prefix}${wrap}${newUrl}${wrap}`
 }
 
+const withCssSource = (
+  message: string,
+  line: number | undefined,
+  segments: CssSegment[] | undefined,
+  root: string,
+): string => {
+  if (!segments || line == null) {
+    return message
+  }
+  let segment: CssSegment | undefined
+  for (const candidate of segments) {
+    if (candidate.startLine > line) break
+    segment = candidate
+  }
+  if (!segment) {
+    return message
+  }
+  const id = cleanUrl(segment.id)
+  const file = id.startsWith('\0')
+    ? id.slice(1)
+    : slash(path.relative(root, id))
+  // only the file: the line is a position in the processed CSS, not the source
+  return `${file}\n${message}`
+}
+
 async function minifyCSS(
   css: string,
   config: ResolvedConfig,
   inlined: boolean,
   filename: string = defaultCssBundleName,
+  segments?: CssSegment[],
 ) {
   // We want inlined CSS to not end with a linebreak, while ensuring that
   // regular CSS assets do end with a linebreak.
@@ -2388,7 +2481,18 @@ async function minifyCSS(
       if (warnings.length) {
         const msgs = await formatMessages(warnings, { kind: 'warning' })
         config.logger.warn(
-          colors.yellow(`[esbuild css minify]\n${msgs.join('\n')}`),
+          colors.yellow(
+            `[esbuild css minify]\n${msgs
+              .map((msg, i) =>
+                withCssSource(
+                  msg,
+                  warnings[i].location?.line,
+                  segments,
+                  config.root,
+                ),
+              )
+              .join('\n')}`,
+          ),
         )
       }
       // esbuild output does return a linebreak at the end
@@ -2423,6 +2527,7 @@ async function minifyCSS(
         line: warning.loc.line,
         column: warning.loc.column - 1, // 1-based
       })}`
+      msg = withCssSource(msg, warning.loc?.line, segments, config.root)
       config.logger.warn(colors.yellow(msg))
     }
 
